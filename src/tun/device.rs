@@ -16,7 +16,7 @@ impl Device {
     pub fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.tun.read(buffer)
     }
-    pub fn send(&mut self, packet: &[u8]) -> io::Result<()> {
+    pub fn send_all(&mut self, packet: &[u8]) -> io::Result<()> {
         self.tun.write_all(packet)
     }
 }
