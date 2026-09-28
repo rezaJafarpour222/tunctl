@@ -1,3 +1,4 @@
+pub mod connector;
 pub mod core;
-pub mod outbound;
+pub mod policies;
 pub mod tun;
