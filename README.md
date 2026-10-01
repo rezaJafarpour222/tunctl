@@ -89,7 +89,3 @@ The Linux routing table directs selected traffic into the TUN interface. `tunctl
 ## Security
 
 SOCKS5 credentials are supplied through command-line arguments. Avoid sharing terminal output or process information containing credentials.
-
-## License
-
-See the [LICENSE](LICENSE) file for licensing information.
