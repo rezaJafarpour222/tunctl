@@ -26,7 +26,7 @@ A Linux TUN-based proxy client that routes system traffic through a SOCKS5 serve
 ### Build from source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/tunctl.git
+git clone https://github.com/rezaJafarpour222/tunctl.git
 cd tunctl
 cargo build --release
 ```
