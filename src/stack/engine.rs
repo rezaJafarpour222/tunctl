@@ -1,96 +1,115 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    thread,
+    time::Duration,
+};
 
 use tokio::sync::mpsc;
+
+use crate::{
+    config::Config,
+    connector::socks5::Socks5Connector,
+    policies::linux::RoutingPolicy,
+    stack::proxy_stack::{ProxyStack, RemoteEvent},
+    tun::device::Device,
+};
 
 const PACKET_CHANNEL_CAPACITY: usize = 1024;
 const REMOTE_EVENT_CHANNEL_CAPACITY: usize = 4096;
 const PROCESS_INTERVAL: Duration = Duration::from_millis(10);
 const MIN_TUN_BUFFER_SIZE: usize = 65_536;
 
+// Internal TUN configuration.
+const TUN_NAME: &str = "socks5ctl";
+
+const TUN_IPV4: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
+const TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+
+const TUN_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0200, 0x0000, 0x0001, 0, 0, 0, 1);
+
+const TUN_IPV6_PREFIX: u8 = 64;
+const TUN_MTU: usize = 1500;
+
+// Internal policy-routing configuration.
+const ROUTE_TABLE: u32 = 51820;
+const RULE_PRIORITY: u32 = 12000;
+const BYPASS_UID: u32 = 0;
+
 pub async fn run(config: Config) -> io::Result<()> {
-    let tun = create_tun(&config)?;
+    let mut tun = Device::new(TUN_NAME)?;
 
-    let proxy_addr = resolve_proxy_address(&config.socks5_addr).await?;
+    let proxy_addr = resolve_proxy_address(&config.socks5).await?;
 
-    print_proxy_info(&config.socks5_addr, proxy_addr);
+    print_proxy_info(&config.socks5, proxy_addr);
 
     let socks5 = create_socks5(&config, proxy_addr)?;
 
-    let _routing = install_routing(&config, &tun, proxy_addr)?;
+    let _routing = install_routing(&tun, proxy_addr, config.auto_route)?;
 
     let (packet_tx, mut packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
 
-    spawn_tun_reader(Arc::clone(&tun), packet_tx, config.tun_mtu);
+    let tun_reader = tun.try_clone()?;
+
+    spawn_tun_reader(tun_reader, packet_tx);
 
     let (remote_event_tx, mut remote_event_rx) = mpsc::channel(REMOTE_EVENT_CHANNEL_CAPACITY);
 
     let mut stack = ProxyStack::new(
-        config.tun_ipv4,
-        config.tun_netmask,
-        config.tun_ipv6,
-        config.tun_ipv6_prefix,
-        config.tun_mtu,
+        TUN_IPV4,
+        TUN_NETMASK,
+        TUN_IPV6,
+        TUN_IPV6_PREFIX,
+        TUN_MTU,
         socks5,
-        config.domain_mode,
         remote_event_tx,
     )?;
 
     print_runtime_info(tun.name(), config.auto_route);
 
-    run_event_loop(&tun, &mut stack, &mut packet_rx, &mut remote_event_rx).await
+    run_event_loop(&mut tun, &mut stack, &mut packet_rx, &mut remote_event_rx).await
 }
 
-fn create_tun(config: &Config) -> io::Result<Arc<TunDevice>> {
-    let tun = TunDevice::new(
-        &config.tun_name,
-        config.tun_ipv4,
-        config.tun_netmask,
-        config.tun_mtu,
-    )?;
+fn create_socks5(
+    config: &Config,
+    proxy_addr: SocketAddr,
+) -> io::Result<std::sync::Arc<Socks5Connector>> {
+    let socks5 =
+        Socks5Connector::new(proxy_addr, config.username.clone(), config.password.clone())?;
 
-    Ok(Arc::new(tun))
-}
-
-fn create_socks5(config: &Config, proxy_addr: SocketAddr) -> io::Result<Arc<Socks5Connector>> {
-    let socks5 = Socks5Connector::new(
-        proxy_addr,
-        config.socks5_username.clone(),
-        config.socks5_password.clone(),
-    )?;
-
-    Ok(Arc::new(socks5))
+    Ok(std::sync::Arc::new(socks5))
 }
 
 fn install_routing(
-    config: &Config,
-    tun: &TunDevice,
+    tun: &Device,
     proxy_addr: SocketAddr,
+    auto_route: bool,
 ) -> io::Result<Option<RoutingPolicy>> {
-    if !config.auto_route {
+    if !auto_route {
         return Ok(None);
     }
 
     let routing = RoutingPolicy::install(
         tun.name(),
-        config.tun_ipv6,
-        config.tun_ipv6_prefix,
-        config.route_table,
-        config.rule_priority,
-        config.bypass_uid,
+        TUN_IPV6,
+        TUN_IPV6_PREFIX,
+        ROUTE_TABLE,
+        RULE_PRIORITY,
+        BYPASS_UID,
         proxy_addr,
     )?;
 
     Ok(Some(routing))
 }
 
-fn spawn_tun_reader(tun: Arc<TunDevice>, packet_tx: mpsc::Sender<Vec<u8>>, tun_mtu: usize) {
-    tokio::spawn(async move {
-        let mut buffer = vec![0u8; tun_mtu.max(MIN_TUN_BUFFER_SIZE)];
+fn spawn_tun_reader(mut tun: Device, packet_tx: mpsc::Sender<Vec<u8>>) {
+    thread::spawn(move || {
+        let mut buffer = vec![0u8; TUN_MTU.max(MIN_TUN_BUFFER_SIZE)];
 
         loop {
-            match tun.recv(&mut buffer).await {
+            match tun.recv(&mut buffer) {
                 Ok(size) => {
-                    if packet_tx.send(buffer[..size].to_vec()).await.is_err() {
+                    if packet_tx.blocking_send(buffer[..size].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -115,7 +134,7 @@ fn print_runtime_info(tun_name: &str, auto_route: bool) {
 }
 
 async fn run_event_loop(
-    tun: &TunDevice,
+    tun: &mut Device,
     stack: &mut ProxyStack,
     packet_rx: &mut mpsc::Receiver<Vec<u8>>,
     remote_event_rx: &mut mpsc::Receiver<RemoteEvent>,
@@ -144,12 +163,34 @@ async fn run_event_loop(
                 }
             }
 
-            Some(packet) = packet_rx.recv() => {
-                stack.ingest_packet(packet);
+            packet = packet_rx.recv() => {
+                match packet {
+                    Some(packet) => {
+                        stack.ingest_packet(packet);
+                    }
+
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "TUN reader stopped",
+                        ));
+                    }
+                }
             }
 
-            Some(event) = remote_event_rx.recv() => {
-                stack.handle_remote_event(event);
+            event = remote_event_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        stack.handle_remote_event(event);
+                    }
+
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "remote event channel closed",
+                        ));
+                    }
+                }
             }
 
             _ = ticker.tick() => {}
@@ -157,13 +198,13 @@ async fn run_event_loop(
 
         stack.process();
 
-        send_pending_packets(tun, stack).await?;
+        send_pending_packets(tun, stack)?;
     }
 }
 
-async fn send_pending_packets(tun: &TunDevice, stack: &mut ProxyStack) -> io::Result<()> {
+fn send_pending_packets(tun: &mut Device, stack: &mut ProxyStack) -> io::Result<()> {
     for packet in stack.drain_tx() {
-        tun.send_all(&packet).await?;
+        tun.send_all(&packet)?;
     }
 
     Ok(())

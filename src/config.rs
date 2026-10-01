@@ -2,7 +2,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "proxyctl",
+    name = "socksctl",
     version,
     about = "Userspace TCP proxy through a SOCKS5 server"
 )]

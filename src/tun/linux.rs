@@ -1,29 +1,38 @@
-use std::{io, os::fd::AsRawFd};
+use std::{io, net::UdpSocket, os::fd::AsRawFd};
 
 unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
 }
 
-// NOTE: Maximum size of an interface name on Linux.
+// Maximum size of an interface name on Linux, including the terminating NUL.
 const IFNAMSIZ: usize = 16;
 
-// NOTE: [flag] IFF_TUN: Create/use a TUN device with no Ethernet header.
+// Create/use a TUN device with no Ethernet header.
 const IFF_TUN: u16 = 0x0001;
 
-// NOTE: [flag] IFF_NO_PI: Disable the extra packet-information header.
+// Disable the extra packet-information header.
 const IFF_NO_PI: u16 = 0x1000;
 
-// NOTE: Linux TUNSETIFF ioctl request.
-const TUNSETIFF: u64 = 0x400454CA;
+// Bring the network interface administratively up.
+const IFF_UP: i16 = 0x0001;
 
-// NOTE: Represent union type of ifreq in C.
+// Linux TUNSETIFF ioctl request.
+const TUNSETIFF: u64 = 0x4004_54CA;
+
+// Get interface flags.
+const SIOCGIFFLAGS: u64 = 0x8913;
+
+// Set interface flags.
+const SIOCSIFFLAGS: u64 = 0x8914;
+
+// Represent the union part of Linux struct ifreq.
 #[repr(C)]
 union IfReqData {
     flags: i16,
     _raw: [u64; 3],
 }
 
-// NOTE: Represent struct ifreq in C.
+// Represent Linux struct ifreq.
 #[repr(C)]
 struct IfReq {
     name: [u8; IFNAMSIZ],
@@ -31,7 +40,7 @@ struct IfReq {
 }
 
 impl IfReq {
-    pub fn new(name: &str) -> io::Result<Self> {
+    fn new(name: &str) -> io::Result<Self> {
         let name = name.as_bytes();
 
         if name.len() >= IFNAMSIZ {
@@ -61,6 +70,35 @@ fn new_tun_file_descriptor() -> io::Result<std::fs::File> {
         .open("/dev/net/tun")
 }
 
+fn set_interface_up(name: &str) -> io::Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let fd = socket.as_raw_fd();
+
+    let mut ifreq = IfReq::new(name)?;
+
+    let result = unsafe { ioctl(fd, SIOCGIFFLAGS, &mut ifreq as *mut IfReq) };
+
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let flags = unsafe { ifreq.data.flags };
+
+    if flags & IFF_UP != 0 {
+        return Ok(());
+    }
+
+    ifreq.data.flags = flags | IFF_UP;
+
+    let result = unsafe { ioctl(fd, SIOCSIFFLAGS, &mut ifreq as *mut IfReq) };
+
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 pub fn create_tun(name: &str) -> io::Result<std::fs::File> {
     let tun_fd = new_tun_file_descriptor()?;
     let mut ifreq = IfReq::new(name)?;
@@ -70,6 +108,8 @@ pub fn create_tun(name: &str) -> io::Result<std::fs::File> {
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
+
+    set_interface_up(name)?;
 
     Ok(tun_fd)
 }

@@ -4,7 +4,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-const POLICY_MARK: &str = "0x1/0x1";
+const POLICY_MARK: &str = "0x1";
+const POLICY_FWMARK: &str = "0x1/0x1";
+
 const NFT_FAMILY: &str = "inet";
 const NFT_CHAIN: &str = "output";
 
@@ -47,11 +49,13 @@ impl RoutingPolicy {
 
         if let Err(error) = add_default_route(false, interface, table) {
             let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+
             return Err(error);
         }
 
         if let Err(error) = add_default_route(true, interface, table) {
             let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+
             return Err(error);
         }
 
@@ -59,16 +63,19 @@ impl RoutingPolicy {
 
         if let Err(error) = run_nft_script(&script) {
             let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+
             return Err(error);
         }
 
         if let Err(error) = add_rule(false, priority, table) {
             let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+
             return Err(error);
         }
 
         if let Err(error) = add_rule(true, priority, table) {
             let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+
             return Err(error);
         }
 
@@ -203,7 +210,7 @@ fn add_rule(ipv6: bool, priority: u32, table: u32) -> io::Result<()> {
                 "pref",
                 &priority,
                 "fwmark",
-                POLICY_MARK,
+                POLICY_FWMARK,
                 "lookup",
                 &table,
             ],
@@ -217,7 +224,7 @@ fn add_rule(ipv6: bool, priority: u32, table: u32) -> io::Result<()> {
                 "pref",
                 &priority,
                 "fwmark",
-                POLICY_MARK,
+                POLICY_FWMARK,
                 "lookup",
                 &table,
             ],
@@ -266,6 +273,7 @@ fn build_nft_script(nft_table: &str, bypass_uid: u32, proxy_addr: SocketAddr) ->
                 address.port(),
             ));
         }
+
         SocketAddr::V6(address) => {
             script.push_str(&format!(
                 "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
@@ -276,13 +284,21 @@ fn build_nft_script(nft_table: &str, bypass_uid: u32, proxy_addr: SocketAddr) ->
         }
     }
 
-    // TCP-only proxy: prevent QUIC/HTTP3 from escaping through the normal route.
+    // This proxy currently handles TCP only.
+    // Prevent HTTPS over QUIC/HTTP3 from escaping directly.
     script.push_str(&format!(
         "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
          udp dport 443 drop\n"
     ));
 
-    // Mark every other TCP packet for policy routing into the TUN table.
+    // Mark all TCP traffic for policy routing.
+    //
+    // IMPORTANT:
+    // `meta l4proto tcp` is the protocol match.
+    // `meta mark set 0x1` is the mark assignment.
+    //
+    // The `/0x1` mask belongs to the fwmark lookup rule,
+    // not to the mark assignment.
     script.push_str(&format!(
         "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
          meta l4proto tcp meta mark set {POLICY_MARK}\n"
@@ -305,6 +321,7 @@ fn run_nft_script(script: &str) -> io::Result<()> {
                 .ok_or_else(|| io::Error::other("failed to open nft stdin"))?;
 
             stdin.write_all(script.as_bytes())?;
+
             child.wait_with_output()
         })?;
 
@@ -397,7 +414,7 @@ mod tests {
     }
 
     fn test_proxy_addr_v6() -> SocketAddr {
-        SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10), 1080))
+        SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10), 1080))
     }
 
     #[test]
@@ -449,7 +466,7 @@ mod tests {
 
         assert!(script.contains(
             "add rule inet tun_test output \
-             ip6 daddr 2001:db8::a tcp dport 1080 return"
+             ip6 daddr 2001:db8::10 tcp dport 1080 return"
         ));
     }
 
@@ -469,8 +486,15 @@ mod tests {
 
         assert!(script.contains(
             "add rule inet tun_test output \
-             meta l4proto tcp meta mark set 0x1/0x1"
+             meta l4proto tcp meta mark set 0x1"
         ));
+    }
+
+    #[test]
+    fn nft_script_does_not_use_mask_when_setting_mark() {
+        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
+
+        assert!(!script.contains("meta mark set 0x1/0x1"));
     }
 
     #[test]
@@ -485,9 +509,7 @@ mod tests {
 
         let udp = script.find("udp dport 443 drop").unwrap();
 
-        let mark = script
-            .find("meta l4proto tcp meta mark set 0x1/0x1")
-            .unwrap();
+        let mark = script.find("meta l4proto tcp meta mark set 0x1").unwrap();
 
         assert!(uid < proxy);
         assert!(proxy < udp);
@@ -531,6 +553,7 @@ mod tests {
         let error = run("false", &[]).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
+
         assert!(error.to_string().contains("false failed"));
     }
 }
