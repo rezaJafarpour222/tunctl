@@ -1,31 +1,11 @@
-use std::{
-    io::{self, Read},
-    os::fd::AsRawFd,
-};
+#[cfg(not(target_os = "linux"))]
+compile_error!("proxyctl currently supports Linux only");
 
-use tun::tun::linux::create_tun;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::Config::from_args()?;
 
-fn main() -> io::Result<()> {
-    let mut tun = create_tun("tun0")?;
+    engine::run(config).await?;
 
-    println!("created tun0");
-    println!("fd = {}", tun.as_raw_fd());
-
-    let mut packet = [0u8; 1500];
-
-    loop {
-        let n = tun.read(&mut packet)?;
-
-        if n == 0 {
-            continue;
-        }
-
-        let version = packet[0] >> 4;
-
-        match version {
-            4 => println!("IPv4 packet: {n} bytes"),
-            6 => println!("IPv6 packet: {n} bytes"),
-            version => println!("Unknown IP version: {version}"),
-        }
-    }
+    Ok(())
 }
