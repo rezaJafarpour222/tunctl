@@ -1,4 +1,4 @@
-use tun::{config, stack::engine};
+use tunctl::{config, stack::engine};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("proxyctl currently supports Linux only");
