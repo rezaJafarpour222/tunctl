@@ -46,7 +46,7 @@ pub async fn run(config: Config) -> io::Result<()> {
 
     let socks5 = create_socks5(&config, proxy_addr)?;
 
-    let _routing = install_routing(&tun, proxy_addr, config.auto_route)?;
+    let _routing = install_routing(&tun, proxy_addr)?;
 
     let (packet_tx, mut packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
 
@@ -66,9 +66,16 @@ pub async fn run(config: Config) -> io::Result<()> {
         remote_event_tx,
     )?;
 
-    print_runtime_info(tun.name(), config.auto_route);
+    print_runtime_info(tun.name(), config.debug);
 
-    run_event_loop(&mut tun, &mut stack, &mut packet_rx, &mut remote_event_rx).await
+    run_event_loop(
+        &mut tun,
+        &mut stack,
+        &mut packet_rx,
+        &mut remote_event_rx,
+        config.debug,
+    )
+    .await
 }
 
 fn create_socks5(
@@ -81,15 +88,7 @@ fn create_socks5(
     Ok(std::sync::Arc::new(socks5))
 }
 
-fn install_routing(
-    tun: &Device,
-    proxy_addr: SocketAddr,
-    auto_route: bool,
-) -> io::Result<Option<RoutingPolicy>> {
-    if !auto_route {
-        return Ok(None);
-    }
-
+fn install_routing(tun: &Device, proxy_addr: SocketAddr) -> io::Result<Option<RoutingPolicy>> {
     let routing = RoutingPolicy::install(
         tun.name(),
         TUN_IPV4,
@@ -136,7 +135,7 @@ fn print_proxy_info(configured_address: &str, resolved_address: SocketAddr) {
 fn print_runtime_info(tun_name: &str, auto_route: bool) {
     println!("TUN device: {}", tun_name);
 
-    println!("auto route: {}", auto_route);
+    println!("Debug: {}", auto_route);
 
     println!("TCP stack: smoltcp 0.14");
 }
@@ -146,6 +145,7 @@ async fn run_event_loop(
     stack: &mut ProxyStack,
     packet_rx: &mut mpsc::Receiver<Vec<u8>>,
     remote_event_rx: &mut mpsc::Receiver<RemoteEvent>,
+    debug: bool,
 ) -> io::Result<()> {
     let mut ticker = tokio::time::interval(PROCESS_INTERVAL);
 
@@ -211,7 +211,7 @@ async fn run_event_loop(
             _ = ticker.tick() => {}
         }
 
-        stack.process();
+        stack.process(debug);
 
         send_pending_packets(tun, stack)?;
     }

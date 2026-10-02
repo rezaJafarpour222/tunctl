@@ -21,7 +21,7 @@ pub struct Config {
 
     /// Install Linux routing policy automatically
     #[arg(long)]
-    pub auto_route: bool,
+    pub debug: bool,
 }
 
 impl Config {

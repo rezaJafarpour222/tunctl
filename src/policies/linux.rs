@@ -451,9 +451,6 @@ fn route_table_empty(ipv6: bool, table: u32) -> io::Result<bool> {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // A routing table that does not exist yet is fine.
-    // It will be created by:
-    //     ip route replace ... table 51820
     if stderr.contains("FIB table does not exist") {
         return Ok(true);
     }

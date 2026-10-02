@@ -133,13 +133,13 @@ impl ProxyStack {
         self.device.push_rx(packet);
     }
 
-    pub fn process(&mut self) {
+    pub fn process(&mut self, debug: bool) {
         let now = Instant::now();
 
         self.process_ingress(now);
         self.iface.poll_maintenance(now);
 
-        self.service_flows();
+        self.service_flows(debug);
 
         self.process_egress(now);
 
@@ -258,15 +258,15 @@ impl ProxyStack {
         );
     }
 
-    fn service_flows(&mut self) {
+    fn service_flows(&mut self, debug: bool) {
         let keys: Vec<TcpFlowKey> = self.flows.keys().copied().collect();
 
         for key in keys {
-            self.service_flow(key);
+            self.service_flow(key, debug);
         }
     }
 
-    fn service_flow(&mut self, key: TcpFlowKey) {
+    fn service_flow(&mut self, key: TcpFlowKey, debug: bool) {
         let Some(flow) = self.flows.get(&key) else {
             return;
         };
@@ -277,7 +277,7 @@ impl ProxyStack {
 
         self.handle_client_data(key, client_data, client_finished);
 
-        self.maybe_start_remote(key);
+        self.maybe_start_remote(key, debug);
         self.flush_to_remote(key);
         self.flush_from_remote(key);
 
@@ -349,7 +349,7 @@ impl ProxyStack {
         }
     }
 
-    fn maybe_start_remote(&mut self, key: TcpFlowKey) {
+    fn maybe_start_remote(&mut self, key: TcpFlowKey, debug: bool) {
         let Some(flow) = self.flows.get(&key) else {
             return;
         };
@@ -363,11 +363,12 @@ impl ProxyStack {
         let Some(target) = target else {
             return;
         };
-
-        eprintln!(
-            "SOCKS5 CONNECT {:?} for {:?} -> {:?}",
-            target, key.source, key.destination
-        );
+        if debug {
+            eprintln!(
+                "SOCKS5 CONNECT {:?} for {:?} -> {:?}",
+                target, key.source, key.destination
+            );
+        }
 
         self.start_remote(key, target);
     }
