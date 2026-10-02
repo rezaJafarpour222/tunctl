@@ -1,8 +1,4 @@
-use std::{io, net::UdpSocket, os::fd::AsRawFd};
-
-unsafe extern "C" {
-    fn ioctl(fd: i32, request: u64, ...) -> i32;
-}
+use std::{io, net::UdpSocket, os::fd::AsRawFd, process::Command};
 
 // Maximum size of an interface name on Linux, including the terminating NUL.
 const IFNAMSIZ: usize = 16;
@@ -24,6 +20,15 @@ const SIOCGIFFLAGS: u64 = 0x8913;
 
 // Set interface flags.
 const SIOCSIFFLAGS: u64 = 0x8914;
+
+// Linux errno value for "No such device".
+const ENODEV: i32 = 19;
+
+const TUN_DEVICE: &str = "/dev/net/tun";
+
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+}
 
 // Represent the union part of Linux struct ifreq.
 #[repr(C)]
@@ -63,11 +68,55 @@ impl IfReq {
     }
 }
 
+/// Open /dev/net/tun.
+///
+/// If the device exists but the TUN kernel module is not loaded,
+/// Linux may return ENODEV (errno 19). In that case, try to load
+/// the module with `modprobe tun` and retry the open.
 fn new_tun_file_descriptor() -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/net/tun")
+        .open(TUN_DEVICE)
+    {
+        Ok(file) => Ok(file),
+
+        Err(original_error) if original_error.raw_os_error() == Some(ENODEV) => {
+            let modprobe_result = Command::new("modprobe").arg("tun").status();
+
+            match modprobe_result {
+                Ok(status) if status.success() => {
+                    // The TUN module was loaded successfully.
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(TUN_DEVICE)
+                }
+
+                Ok(status) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "failed to open {}: {}; \
+                         `modprobe tun` exited with {}. \
+                         Try running `sudo modprobe tun` manually",
+                        TUN_DEVICE, original_error, status
+                    ),
+                )),
+
+                Err(modprobe_error) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "failed to open {}: {}; \
+                         could not execute `modprobe tun`: {}. \
+                         Try running `sudo modprobe tun` manually",
+                        TUN_DEVICE, original_error, modprobe_error
+                    ),
+                )),
+            }
+        }
+
+        Err(error) => Err(error),
+    }
 }
 
 fn set_interface_up(name: &str) -> io::Result<()> {
@@ -101,6 +150,7 @@ fn set_interface_up(name: &str) -> io::Result<()> {
 
 pub fn create_tun(name: &str) -> io::Result<std::fs::File> {
     let tun_fd = new_tun_file_descriptor()?;
+
     let mut ifreq = IfReq::new(name)?;
 
     let result = unsafe { ioctl(tun_fd.as_raw_fd(), TUNSETIFF, &mut ifreq as *mut IfReq) };

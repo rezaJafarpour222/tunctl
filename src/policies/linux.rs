@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    net::{Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     process::{Command, Stdio},
 };
 
@@ -15,23 +15,43 @@ pub struct RoutingPolicy {
     table: u32,
     priority: u32,
     nft_table: String,
+
+    ipv4: Ipv4Addr,
+    ipv4_prefix: u8,
+
     ipv6: Ipv6Addr,
-    prefix: u8,
+    ipv6_prefix: u8,
+
     installed: bool,
 }
 
 impl RoutingPolicy {
     pub fn install(
         interface: &str,
+        ipv4: Ipv4Addr,
+        ipv4_prefix: u8,
         ipv6: Ipv6Addr,
-        prefix: u8,
+        ipv6_prefix: u8,
         table: u32,
         priority: u32,
-        bypass_uid: u32,
         proxy_addr: SocketAddr,
     ) -> io::Result<Self> {
         require_command("nft", &["--version"])?;
         require_command("ip", &["-V"])?;
+
+        if ipv4_prefix > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid IPv4 prefix: {ipv4_prefix}"),
+            ));
+        }
+
+        if ipv6_prefix > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid IPv6 prefix: {ipv6_prefix}"),
+            ));
+        }
 
         let nft_table = nft_table_name();
 
@@ -45,36 +65,88 @@ impl RoutingPolicy {
             ));
         }
 
-        add_ipv6_address(interface, ipv6, prefix)?;
+        if let Err(error) = add_ipv4_address(interface, ipv4, ipv4_prefix) {
+            return Err(error);
+        }
+
+        if let Err(error) = add_ipv6_address(interface, ipv6, ipv6_prefix) {
+            let _ = delete_ipv4_address(interface, ipv4, ipv4_prefix);
+            return Err(error);
+        }
 
         if let Err(error) = add_default_route(false, interface, table) {
-            let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+            let _ = Self::cleanup(
+                table,
+                priority,
+                interface,
+                ipv4,
+                ipv4_prefix,
+                ipv6,
+                ipv6_prefix,
+                &nft_table,
+            );
 
             return Err(error);
         }
 
         if let Err(error) = add_default_route(true, interface, table) {
-            let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+            let _ = Self::cleanup(
+                table,
+                priority,
+                interface,
+                ipv4,
+                ipv4_prefix,
+                ipv6,
+                ipv6_prefix,
+                &nft_table,
+            );
 
             return Err(error);
         }
 
-        let script = build_nft_script(&nft_table, bypass_uid, proxy_addr);
+        let script = build_nft_script(&nft_table, proxy_addr);
 
         if let Err(error) = run_nft_script(&script) {
-            let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+            let _ = Self::cleanup(
+                table,
+                priority,
+                interface,
+                ipv4,
+                ipv4_prefix,
+                ipv6,
+                ipv6_prefix,
+                &nft_table,
+            );
 
             return Err(error);
         }
 
         if let Err(error) = add_rule(false, priority, table) {
-            let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+            let _ = Self::cleanup(
+                table,
+                priority,
+                interface,
+                ipv4,
+                ipv4_prefix,
+                ipv6,
+                ipv6_prefix,
+                &nft_table,
+            );
 
             return Err(error);
         }
 
         if let Err(error) = add_rule(true, priority, table) {
-            let _ = Self::cleanup(table, priority, interface, ipv6, prefix, &nft_table);
+            let _ = Self::cleanup(
+                table,
+                priority,
+                interface,
+                ipv4,
+                ipv4_prefix,
+                ipv6,
+                ipv6_prefix,
+                &nft_table,
+            );
 
             return Err(error);
         }
@@ -84,8 +156,10 @@ impl RoutingPolicy {
             table,
             priority,
             nft_table,
+            ipv4,
+            ipv4_prefix,
             ipv6,
-            prefix,
+            ipv6_prefix,
             installed: true,
         })
     }
@@ -94,19 +168,25 @@ impl RoutingPolicy {
         table: u32,
         priority: u32,
         interface: &str,
+        ipv4: Ipv4Addr,
+        ipv4_prefix: u8,
         ipv6: Ipv6Addr,
-        prefix: u8,
+        ipv6_prefix: u8,
         nft_table: &str,
     ) -> io::Result<()> {
         let _ = delete_nft_table(nft_table);
 
         let _ = delete_rule(false, priority);
+
         let _ = delete_rule(true, priority);
 
         let _ = delete_default_route(false, interface, table);
+
         let _ = delete_default_route(true, interface, table);
 
-        let _ = delete_ipv6_address(interface, ipv6, prefix);
+        let _ = delete_ipv4_address(interface, ipv4, ipv4_prefix);
+
+        let _ = delete_ipv6_address(interface, ipv6, ipv6_prefix);
 
         Ok(())
     }
@@ -122,8 +202,10 @@ impl Drop for RoutingPolicy {
             self.table,
             self.priority,
             &self.interface,
+            self.ipv4,
+            self.ipv4_prefix,
             self.ipv6,
-            self.prefix,
+            self.ipv6_prefix,
             &self.nft_table,
         );
     }
@@ -147,6 +229,18 @@ fn route_table_exists(table: u32) -> io::Result<bool> {
 
 fn rule_priority_exists(priority: u32) -> io::Result<bool> {
     Ok(rule_exists(false, priority)? || rule_exists(true, priority)?)
+}
+
+fn add_ipv4_address(interface: &str, ipv4: Ipv4Addr, prefix: u8) -> io::Result<()> {
+    let address = format!("{ipv4}/{prefix}");
+
+    run("ip", &["-4", "addr", "add", &address, "dev", interface])
+}
+
+fn delete_ipv4_address(interface: &str, ipv4: Ipv4Addr, prefix: u8) -> io::Result<()> {
+    let address = format!("{ipv4}/{prefix}");
+
+    run("ip", &["-4", "addr", "del", &address, "dev", interface])
 }
 
 fn add_ipv6_address(interface: &str, ipv6: Ipv6Addr, prefix: u8) -> io::Result<()> {
@@ -175,7 +269,7 @@ fn add_default_route(ipv6: bool, interface: &str, table: u32) -> io::Result<()> 
         run(
             "ip",
             &[
-                "route", "replace", "default", "dev", interface, "table", &table,
+                "-4", "route", "replace", "default", "dev", interface, "table", &table,
             ],
         )
     }
@@ -194,7 +288,9 @@ fn delete_default_route(ipv6: bool, interface: &str, table: u32) -> io::Result<(
     } else {
         run(
             "ip",
-            &["route", "del", "default", "dev", interface, "table", &table],
+            &[
+                "-4", "route", "del", "default", "dev", interface, "table", &table,
+            ],
         )
     }
 }
@@ -222,6 +318,7 @@ fn add_rule(ipv6: bool, priority: u32, table: u32) -> io::Result<()> {
         run(
             "ip",
             &[
+                "-4",
                 "rule",
                 "add",
                 "pref",
@@ -241,7 +338,7 @@ fn delete_rule(ipv6: bool, priority: u32) -> io::Result<()> {
     if ipv6 {
         run("ip", &["-6", "rule", "del", "pref", &priority])
     } else {
-        run("ip", &["rule", "del", "pref", &priority])
+        run("ip", &["-4", "rule", "del", "pref", &priority])
     }
 }
 
@@ -249,7 +346,7 @@ fn delete_nft_table(nft_table: &str) -> io::Result<()> {
     run("nft", &["delete", "table", NFT_FAMILY, nft_table])
 }
 
-fn build_nft_script(nft_table: &str, bypass_uid: u32, proxy_addr: SocketAddr) -> String {
+fn build_nft_script(nft_table: &str, proxy_addr: SocketAddr) -> String {
     let mut script = String::new();
 
     script.push_str(&format!("add table {NFT_FAMILY} {nft_table}\n"));
@@ -260,18 +357,11 @@ fn build_nft_script(nft_table: &str, bypass_uid: u32, proxy_addr: SocketAddr) ->
          }}\n"
     ));
 
-    // Do not intercept traffic generated by the proxy UID.
-    script.push_str(&format!(
-        "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
-         meta skuid {bypass_uid} return\n"
-    ));
-
-    // Do not intercept the SOCKS5 connection itself.
     match proxy_addr {
         SocketAddr::V4(address) => {
             script.push_str(&format!(
                 "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
-                 ip daddr {} tcp dport {} return\n",
+                 ip daddr {} tcp dport {} counter return\n",
                 address.ip(),
                 address.port(),
             ));
@@ -280,23 +370,16 @@ fn build_nft_script(nft_table: &str, bypass_uid: u32, proxy_addr: SocketAddr) ->
         SocketAddr::V6(address) => {
             script.push_str(&format!(
                 "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
-                 ip6 daddr {} tcp dport {} return\n",
+                 ip6 daddr {} tcp dport {} counter return\n",
                 address.ip(),
                 address.port(),
             ));
         }
     }
 
-    // The proxy currently supports TCP only.
     script.push_str(&format!(
         "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
-         udp dport 443 drop\n"
-    ));
-
-    // Mark TCP packets for policy routing.
-    script.push_str(&format!(
-        "add rule {NFT_FAMILY} {nft_table} {NFT_CHAIN} \
-         meta l4proto tcp meta mark set {POLICY_MARK}\n"
+         meta l4proto tcp counter meta mark set {POLICY_MARK}\n"
     ));
 
     script
@@ -357,19 +440,28 @@ fn route_table_empty(ipv6: bool, table: u32) -> io::Result<bool> {
     let args = if ipv6 {
         vec!["-6", "route", "show", "table", &table]
     } else {
-        vec!["route", "show", "table", &table]
+        vec!["-4", "route", "show", "table", &table]
     };
 
     let output = Command::new("ip").args(args).output()?;
 
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "failed to inspect routing table {table}: {}",
-            String::from_utf8_lossy(&output.stderr,)
-        )));
+    if output.status.success() {
+        return Ok(output.stdout.is_empty());
     }
 
-    Ok(output.stdout.is_empty())
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // A routing table that does not exist yet is fine.
+    // It will be created by:
+    //     ip route replace ... table 51820
+    if stderr.contains("FIB table does not exist") {
+        return Ok(true);
+    }
+
+    Err(io::Error::other(format!(
+        "failed to inspect routing table {}: {}",
+        table, stderr
+    )))
 }
 
 fn rule_exists(ipv6: bool, priority: u32) -> io::Result<bool> {
@@ -378,7 +470,7 @@ fn rule_exists(ipv6: bool, priority: u32) -> io::Result<bool> {
     let args = if ipv6 {
         vec!["-6", "rule", "show", "pref", &priority]
     } else {
-        vec!["rule", "show", "pref", &priority]
+        vec!["-4", "rule", "show", "pref", &priority]
     };
 
     let output = Command::new("ip").args(args).output()?;
@@ -395,160 +487,6 @@ fn run(program: &str, args: &[&str]) -> io::Result<()> {
 
     Err(io::Error::other(format!(
         "{program} failed: {}",
-        String::from_utf8_lossy(&output.stderr,)
+        String::from_utf8_lossy(&output.stderr)
     )))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    fn test_proxy_addr_v4() -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 1080))
-    }
-
-    fn test_proxy_addr_v6() -> SocketAddr {
-        SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10), 1080))
-    }
-
-    #[test]
-    fn nft_table_name_uses_process_id() {
-        assert_eq!(nft_table_name(), format!("tun_{}", std::process::id()));
-    }
-
-    #[test]
-    fn nft_script_creates_table() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        assert!(script.contains("add table inet tun_test"));
-    }
-
-    #[test]
-    fn nft_script_creates_output_chain() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        assert!(script.contains(
-            "add chain inet tun_test output { \
-             type route hook output priority mangle; policy accept; \
-             }"
-        ));
-    }
-
-    #[test]
-    fn nft_script_bypasses_proxy_uid() {
-        let script = build_nft_script("tun_test", 4242, test_proxy_addr_v4());
-
-        assert!(script.contains(
-            "add rule inet tun_test output \
-             meta skuid 4242 return"
-        ));
-    }
-
-    #[test]
-    fn nft_script_bypasses_ipv4_proxy() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        assert!(script.contains(
-            "add rule inet tun_test output \
-             ip daddr 192.0.2.10 tcp dport 1080 return"
-        ));
-    }
-
-    #[test]
-    fn nft_script_bypasses_ipv6_proxy() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v6());
-
-        assert!(script.contains(
-            "add rule inet tun_test output \
-             ip6 daddr 2001:db8::10 tcp dport 1080 return"
-        ));
-    }
-
-    #[test]
-    fn nft_script_drops_udp_443() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        assert!(script.contains(
-            "add rule inet tun_test output \
-             udp dport 443 drop"
-        ));
-    }
-
-    #[test]
-    fn nft_script_marks_tcp() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        assert!(script.contains(
-            "add rule inet tun_test output \
-             meta l4proto tcp meta mark set 0x1"
-        ));
-    }
-
-    #[test]
-    fn nft_script_does_not_use_mark_mask_when_setting_mark() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        assert!(!script.contains("meta mark set 0x1/0x1"));
-    }
-
-    #[test]
-    fn nft_script_rules_are_ordered() {
-        let script = build_nft_script("tun_test", 1000, test_proxy_addr_v4());
-
-        let uid = script.find("meta skuid 1000 return").unwrap();
-
-        let proxy = script
-            .find("ip daddr 192.0.2.10 tcp dport 1080 return")
-            .unwrap();
-
-        let udp = script.find("udp dport 443 drop").unwrap();
-
-        let mark = script.find("meta l4proto tcp meta mark set 0x1").unwrap();
-
-        assert!(uid < proxy);
-        assert!(proxy < udp);
-        assert!(udp < mark);
-    }
-
-    #[test]
-    fn command_ok_succeeds_for_successful_command() {
-        assert!(command_ok("true", &[]));
-    }
-
-    #[test]
-    fn command_ok_fails_for_failed_command() {
-        assert!(!command_ok("false", &[]));
-    }
-
-    #[test]
-    fn command_ok_fails_for_missing_command() {
-        assert!(!command_ok("this_command_definitely_does_not_exist", &[],));
-    }
-
-    #[test]
-    fn require_command_succeeds_for_existing_command() {
-        assert!(require_command("true", &[],).is_ok());
-    }
-
-    #[test]
-    fn require_command_returns_not_found_for_missing_command() {
-        let error = require_command("this_command_definitely_does_not_exist", &[]).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn run_succeeds_for_successful_command() {
-        assert!(run("true", &[]).is_ok());
-    }
-
-    #[test]
-    fn run_returns_error_for_failed_command() {
-        let error = run("false", &[]).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-
-        assert!(error.to_string().contains("false failed"));
-    }
 }

@@ -20,21 +20,22 @@ const REMOTE_EVENT_CHANNEL_CAPACITY: usize = 4096;
 const PROCESS_INTERVAL: Duration = Duration::from_millis(10);
 const MIN_TUN_BUFFER_SIZE: usize = 65_536;
 
-// Internal TUN configuration.
-const TUN_NAME: &str = "socks5ctl";
+const TUN_NAME: &str = "tunctl";
 
 const TUN_IPV4: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
+
 const TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+
+const TUN_IPV4_PREFIX: u8 = 24;
 
 const TUN_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0200, 0x0000, 0x0001, 0, 0, 0, 1);
 
 const TUN_IPV6_PREFIX: u8 = 64;
+
 const TUN_MTU: usize = 1500;
 
-// Internal policy-routing configuration.
 const ROUTE_TABLE: u32 = 51820;
 const RULE_PRIORITY: u32 = 12000;
-const BYPASS_UID: u32 = 0;
 
 pub async fn run(config: Config) -> io::Result<()> {
     let mut tun = Device::new(TUN_NAME)?;
@@ -91,11 +92,12 @@ fn install_routing(
 
     let routing = RoutingPolicy::install(
         tun.name(),
+        TUN_IPV4,
+        TUN_IPV4_PREFIX,
         TUN_IPV6,
         TUN_IPV6_PREFIX,
         ROUTE_TABLE,
         RULE_PRIORITY,
-        BYPASS_UID,
         proxy_addr,
     )?;
 
@@ -109,13 +111,17 @@ fn spawn_tun_reader(mut tun: Device, packet_tx: mpsc::Sender<Vec<u8>>) {
         loop {
             match tun.recv(&mut buffer) {
                 Ok(size) => {
+                    if size == 0 {
+                        continue;
+                    }
+
                     if packet_tx.blocking_send(buffer[..size].to_vec()).is_err() {
                         break;
                     }
                 }
 
                 Err(error) => {
-                    eprintln!("TUN read error: {error}");
+                    eprintln!("TUN read error: {}", error);
                     break;
                 }
             }
@@ -124,12 +130,14 @@ fn spawn_tun_reader(mut tun: Device, packet_tx: mpsc::Sender<Vec<u8>>) {
 }
 
 fn print_proxy_info(configured_address: &str, resolved_address: SocketAddr) {
-    println!("SOCKS5: {configured_address} -> {resolved_address}");
+    println!("SOCKS5: {} -> {}", configured_address, resolved_address);
 }
 
 fn print_runtime_info(tun_name: &str, auto_route: bool) {
-    println!("TUN device: {tun_name}");
-    println!("auto route: {auto_route}");
+    println!("TUN device: {}", tun_name);
+
+    println!("auto route: {}", auto_route);
+
     println!("TCP stack: smoltcp 0.14");
 }
 
@@ -153,12 +161,15 @@ async fn run_event_loop(
                     }
 
                     Err(error) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            format!(
-                                "failed to listen for shutdown signal: {error}"
-                            ),
-                        ));
+                        return Err(
+                            io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                format!(
+                                    "failed to listen for shutdown signal: {}",
+                                    error
+                                ),
+                            )
+                        );
                     }
                 }
             }
@@ -170,10 +181,12 @@ async fn run_event_loop(
                     }
 
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "TUN reader stopped",
-                        ));
+                        return Err(
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "TUN reader stopped",
+                            )
+                        );
                     }
                 }
             }
@@ -185,10 +198,12 @@ async fn run_event_loop(
                     }
 
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "remote event channel closed",
-                        ));
+                        return Err(
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "remote event channel closed",
+                            )
+                        );
                     }
                 }
             }
@@ -204,6 +219,10 @@ async fn run_event_loop(
 
 fn send_pending_packets(tun: &mut Device, stack: &mut ProxyStack) -> io::Result<()> {
     for packet in stack.drain_tx() {
+        if packet.is_empty() {
+            continue;
+        }
+
         tun.send_all(&packet)?;
     }
 
@@ -218,14 +237,14 @@ async fn resolve_proxy_address(value: &str) -> io::Result<SocketAddr> {
     let mut addresses = tokio::net::lookup_host(value).await.map_err(|error| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            format!("failed to resolve SOCKS5 proxy `{value}`: {error}"),
+            format!("failed to resolve SOCKS5 proxy `{}`: {}", value, error),
         )
     })?;
 
     addresses.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            format!("SOCKS5 proxy `{value}` resolved to no addresses"),
+            format!("SOCKS5 proxy `{}` resolved to no addresses", value),
         )
     })
 }

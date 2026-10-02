@@ -6,7 +6,7 @@ use std::{
 
 use crate::tun::linux::create_tun;
 
-const RP_FILTER_DISABLED: u8 = 0;
+const RP_FILTER_MODE: u8 = 2;
 const UDEV_SETTLE_TIMEOUT_SECONDS: &str = "5";
 
 pub struct Device {
@@ -25,7 +25,7 @@ impl Device {
             tun,
         };
 
-        device.set_rp_filter(RP_FILTER_DISABLED)?;
+        device.set_rp_filter(RP_FILTER_MODE)?;
 
         Ok(device)
     }
@@ -57,23 +57,28 @@ impl Device {
             ));
         }
 
-        let path = format!("/proc/sys/net/ipv4/conf/{}/rp_filter", self.name);
+        let interface_path = format!("/proc/sys/net/ipv4/conf/{}/rp_filter", self.name);
 
-        let before = read_rp_filter(&path)?;
+        let all_path = "/proc/sys/net/ipv4/conf/all/rp_filter";
 
-        std::fs::write(&path, value.to_string())?;
+        let before_interface = read_rp_filter(&interface_path)?;
+        let before_all = read_rp_filter(all_path)?;
 
-        let after = read_rp_filter(&path)?;
+        std::fs::write(&interface_path, value.to_string())?;
 
-        if after != value {
+        let after_interface = read_rp_filter(&interface_path)?;
+        let after_all = read_rp_filter(all_path)?;
+
+        if after_interface != value {
             return Err(io::Error::other(format!(
-                "failed to set rp_filter for {}: \
-                 expected {}, got {}",
-                self.name, value, after
+                "failed to set rp_filter for {}: expected {}, got {}",
+                self.name, value, after_interface
             )));
         }
 
-        eprintln!("TUN rp_filter: {before} -> {after}");
+        let effective = after_all.max(after_interface);
+
+        eprintln!("TUN rp_filter: {} -> {}", before_interface, after_interface);
 
         Ok(())
     }
